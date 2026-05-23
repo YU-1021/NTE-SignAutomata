@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 塔吉多（异环）自动签到脚本
+使用 TOKEN.txt 文件存储账号信息，签到后自动更新 token
 """
 import base64
 import hashlib
@@ -26,6 +27,7 @@ except ImportError:
     print("运行: pip install cryptography")
     sys.exit(1)
 
+TOKEN_FILE = 'TOKEN.txt'
 DEFAULT_GAME_ID = '1289'
 COMMUNITY_ID = '1'
 APP_ID = '10550'
@@ -94,6 +96,74 @@ def is_signed(msg):
     return any(k in msg for k in ['已签到', '签到过', '重复签到'])
 
 
+def dedup_list(items):
+    result = []
+    for item in items:
+        if item and item not in result:
+            result.append(item)
+    return result
+
+
+def parse_role_ids(role_text):
+    if not role_text:
+        return []
+    if isinstance(role_text, list):
+        return dedup_list([str(i).strip() for i in role_text if str(i).strip()])
+    text = str(role_text).replace('\n', ',')
+    return dedup_list([i.strip() for i in text.split(',') if i.strip()])
+
+
+def parse_account_line(line):
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        raw = json.loads(line)
+    except:
+        return {
+            'refreshToken': line,
+            'uid': '',
+            'deviceId': uuid.uuid4().hex,
+            'gameId': DEFAULT_GAME_ID,
+            'roleIds': [],
+        }
+    return {
+        'refreshToken': raw.get('refreshToken') or raw.get('token') or '',
+        'uid': str(raw.get('uid') or ''),
+        'deviceId': raw.get('deviceId') or raw.get('deviceid') or uuid.uuid4().hex,
+        'gameId': raw.get('gameId') or raw.get('game_id') or DEFAULT_GAME_ID,
+        'roleIds': parse_role_ids(raw.get('roleIds') or raw.get('role_ids') or raw.get('roleId')),
+    }
+
+
+def account_to_line(account):
+    return json.dumps({
+        'refreshToken': account['refreshToken'],
+        'uid': account.get('uid', ''),
+        'deviceId': account.get('deviceId', uuid.uuid4().hex),
+        'gameId': account.get('gameId', DEFAULT_GAME_ID),
+        'roleIds': dedup_list(account.get('roleIds', [])),
+    }, ensure_ascii=False)
+
+
+def read_accounts():
+    if not os.path.exists(TOKEN_FILE):
+        return []
+    accounts = []
+    with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
+        for line in f.readlines():
+            account = parse_account_line(line)
+            if account and account['refreshToken']:
+                accounts.append(account)
+    return accounts
+
+
+def save_accounts(accounts):
+    with open(TOKEN_FILE, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(account_to_line(a) for a in accounts))
+    print(f'账号信息已保存到 {TOKEN_FILE}')
+
+
 def refresh_token(account):
     headers = {
         **HEADERS,
@@ -160,9 +230,7 @@ def app_sign(token, uid, device_id):
 def get_sign_state(token, game_id):
     resp = get(GAME_SIGNIN_STATE_URL, {'gameId': game_id}, {'Authorization': token})
     data = json_resp(resp, '签到状态')
-    if is_ok(data):
-        return data.get('data') or {}
-    return {}
+    return (data.get('data') or {}) if is_ok(data) else {}
 
 
 def get_rewards(token, role_id, game_id):
@@ -220,88 +288,6 @@ def game_sign(token, role_id, game_id):
     return False, '游戏签到失败'
 
 
-def parse_account(text):
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        raw = json.loads(text)
-    except:
-        return {
-            'refreshToken': text,
-            'uid': '',
-            'deviceId': uuid.uuid4().hex,
-            'gameId': DEFAULT_GAME_ID,
-            'roleIds': [],
-        }
-    return {
-        'refreshToken': raw.get('refreshToken') or raw.get('token') or '',
-        'uid': str(raw.get('uid') or ''),
-        'deviceId': raw.get('deviceId') or raw.get('deviceid') or uuid.uuid4().hex,
-        'gameId': raw.get('gameId') or raw.get('game_id') or DEFAULT_GAME_ID,
-        'roleIds': raw.get('roleIds') or raw.get('role_ids') or raw.get('roleId') or [],
-    }
-
-
-def account_to_json(account):
-    return json.dumps({
-        'refreshToken': account['refreshToken'],
-        'uid': account['uid'],
-        'deviceId': account['deviceId'],
-        'gameId': account['gameId'],
-        'roleIds': account['roleIds']
-    }, ensure_ascii=False, separators=(',', ': '))
-
-
-def load_accounts():
-    token = os.environ.get('TJD_TOKEN', '').strip()
-    if not token:
-        return []
-    lines = [l.strip() for l in token.replace('\r\n', '\n').split('\n') if l.strip()]
-    if len(lines) == 1 and ',' in lines[0] and not lines[0].startswith('{'):
-        lines = [l.strip() for l in lines[0].split(',') if l.strip()]
-    return [a for a in [parse_account(l) for l in lines] if a and a['refreshToken']]
-
-
-def save_accounts(accounts):
-    try:
-        ql_dir = os.environ.get('QL_DIR', '/ql')
-        env_file = os.path.join(ql_dir, 'data', 'env.sh')
-        
-        token_value = '\n'.join(account_to_json(acc) for acc in accounts)
-        
-        env_content = ''
-        if os.path.exists(env_file):
-            with open(env_file, 'r', encoding='utf-8') as f:
-                env_content = f.read()
-        
-        lines = env_content.split('\n')
-        new_lines = []
-        found = False
-        
-        for line in lines:
-            if line.startswith('export TJD_TOKEN='):
-                new_lines.append(f'export TJD_TOKEN="{token_value}"')
-                found = True
-            else:
-                new_lines.append(line)
-        
-        if not found:
-            if new_lines and new_lines[-1]:
-                new_lines.append('')
-            new_lines.append(f'export TJD_TOKEN="{token_value}"')
-        
-        os.makedirs(os.path.dirname(env_file), exist_ok=True)
-        with open(env_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(new_lines))
-        
-        print('Token已更新保存')
-        return True
-    except Exception as e:
-        print(f'保存Token失败: {e}')
-        return False
-
-
 def do_sign(account):
     account['gameId'] = account.get('gameId') or DEFAULT_GAME_ID
     account['deviceId'] = account.get('deviceId') or uuid.uuid4().hex
@@ -324,7 +310,6 @@ def do_sign(account):
         role_ids.extend([r.strip() for r in env_roles.replace('\n', ',').split(',') if r.strip()])
     if not role_ids and uid:
         role_ids = get_roles(token, uid, account['deviceId'], account['gameId'])
-    account['roleIds'] = role_ids
     
     if not role_ids:
         print('未找到角色ID')
@@ -351,10 +336,11 @@ def main():
     print('塔吉多自动签到')
     print('=' * 50)
     
-    accounts = load_accounts()
+    accounts = read_accounts()
     if not accounts:
-        print('未配置账号，请设置环境变量 TJD_TOKEN')
-        print('获取Token方法: 在本地运行 get_token.py')
+        print(f'未找到账号，请在 {TOKEN_FILE} 中配置')
+        print('格式: {"refreshToken":"xxx","uid":"xxx","deviceId":"xxx","gameId":"1289","roleIds":["xxx"]}')
+        print('或直接填写 refreshToken 字符串')
         return False
     
     print(f'读取到 {len(accounts)} 个账号\n')
