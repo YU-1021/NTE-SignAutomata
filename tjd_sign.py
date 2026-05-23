@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 塔吉多（异环）自动签到脚本
-使用 TOKEN.txt 文件存储账号信息，签到后自动更新 token
+支持青龙API自动更新Token
 """
 import base64
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -27,7 +28,6 @@ except ImportError:
     print("运行: pip install cryptography")
     sys.exit(1)
 
-TOKEN_FILE = 'TOKEN.txt'
 DEFAULT_GAME_ID = '1289'
 COMMUNITY_ID = '1'
 APP_ID = '10550'
@@ -57,6 +57,126 @@ APP_SIGNIN_URL = 'https://bbs-api.tajiduo.com/apihub/api/signin'
 GAME_SIGNIN_URL = 'https://bbs-api.tajiduo.com/apihub/awapi/sign'
 GAME_SIGNIN_STATE_URL = 'https://bbs-api.tajiduo.com/apihub/awapi/signin/state'
 GAME_SIGN_REWARDS_URL = 'https://bbs-api.tajiduo.com/apihub/awapi/sign/rewards'
+
+
+class QingLongAPI:
+    def __init__(self):
+        self.url = ''
+        self.client_id = ''
+        self.client_secret = ''
+        self.access_token = ''
+        self.enabled = False
+        self._parse_config()
+    
+    def _parse_config(self):
+        config = os.environ.get('TJD_API', '').strip()
+        if not config:
+            return
+        
+        try:
+            for item in config.split(';'):
+                item = item.strip()
+                if '=' in item:
+                    key, value = item.split('=', 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key == 'QL_URL':
+                        self.url = value.rstrip('/')
+                    elif key == 'CLIENT_ID':
+                        self.client_id = value
+                    elif key == 'CLIENT_SECRET':
+                        self.client_secret = value
+            
+            if self.url and self.client_id and self.client_secret:
+                self.enabled = True
+        except:
+            pass
+    
+    def _get_token(self):
+        if not self.enabled:
+            return ''
+        try:
+            resp = requests.get(
+                f"{self.url}/open/auth/token",
+                params={'client_id': self.client_id, 'client_secret': self.client_secret},
+                timeout=10
+            )
+            data = resp.json()
+            if data.get('code') == 200:
+                self.access_token = data.get('data', {}).get('token', '')
+                return self.access_token
+        except:
+            pass
+        return ''
+    
+    def _auth_header(self):
+        if not self.access_token:
+            self._get_token()
+        return {'Authorization': f'Bearer {self.access_token}'}
+    
+    def get_env(self, name):
+        if not self.enabled:
+            return None
+        try:
+            if not self.access_token:
+                self._get_token()
+            resp = requests.get(
+                f"{self.url}/open/envs",
+                params={'searchValue': name},
+                headers=self._auth_header(),
+                timeout=10
+            )
+            data = resp.json()
+            if data.get('code') == 200:
+                envs = data.get('data', [])
+                for env in envs:
+                    if env.get('name') == name:
+                        return {
+                            'id': env.get('id'),
+                            'value': env.get('value', ''),
+                            'remarks': env.get('remarks', '')
+                        }
+        except:
+            pass
+        return None
+    
+    def update_env(self, name, value, env_id=None, remarks=''):
+        if not self.enabled:
+            return False
+        try:
+            if not self.access_token:
+                self._get_token()
+            
+            if env_id:
+                resp = requests.put(
+                    f"{self.url}/open/envs",
+                    json={
+                        'id': env_id,
+                        'name': name,
+                        'value': value,
+                        'remarks': remarks
+                    },
+                    headers=self._auth_header(),
+                    timeout=10
+                )
+            else:
+                resp = requests.post(
+                    f"{self.url}/open/envs",
+                    json=[{
+                        'name': name,
+                        'value': value,
+                        'remarks': remarks
+                    }],
+                    headers=self._auth_header(),
+                    timeout=10
+                )
+            return resp.json().get('code') == 200
+        except:
+            pass
+        return False
+
+
+ql_api = QingLongAPI()
 
 
 def sign(params):
@@ -96,74 +216,6 @@ def is_signed(msg):
     return any(k in msg for k in ['已签到', '签到过', '重复签到'])
 
 
-def dedup_list(items):
-    result = []
-    for item in items:
-        if item and item not in result:
-            result.append(item)
-    return result
-
-
-def parse_role_ids(role_text):
-    if not role_text:
-        return []
-    if isinstance(role_text, list):
-        return dedup_list([str(i).strip() for i in role_text if str(i).strip()])
-    text = str(role_text).replace('\n', ',')
-    return dedup_list([i.strip() for i in text.split(',') if i.strip()])
-
-
-def parse_account_line(line):
-    line = line.strip()
-    if not line:
-        return None
-    try:
-        raw = json.loads(line)
-    except:
-        return {
-            'refreshToken': line,
-            'uid': '',
-            'deviceId': uuid.uuid4().hex,
-            'gameId': DEFAULT_GAME_ID,
-            'roleIds': [],
-        }
-    return {
-        'refreshToken': raw.get('refreshToken') or raw.get('token') or '',
-        'uid': str(raw.get('uid') or ''),
-        'deviceId': raw.get('deviceId') or raw.get('deviceid') or uuid.uuid4().hex,
-        'gameId': raw.get('gameId') or raw.get('game_id') or DEFAULT_GAME_ID,
-        'roleIds': parse_role_ids(raw.get('roleIds') or raw.get('role_ids') or raw.get('roleId')),
-    }
-
-
-def account_to_line(account):
-    return json.dumps({
-        'refreshToken': account['refreshToken'],
-        'uid': account.get('uid', ''),
-        'deviceId': account.get('deviceId', uuid.uuid4().hex),
-        'gameId': account.get('gameId', DEFAULT_GAME_ID),
-        'roleIds': dedup_list(account.get('roleIds', [])),
-    }, ensure_ascii=False)
-
-
-def read_accounts():
-    if not os.path.exists(TOKEN_FILE):
-        return []
-    accounts = []
-    with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
-        for line in f.readlines():
-            account = parse_account_line(line)
-            if account and account['refreshToken']:
-                accounts.append(account)
-    return accounts
-
-
-def save_accounts(accounts):
-    with open(TOKEN_FILE, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(account_to_line(a) for a in accounts))
-    print(f'账号信息已保存到 {TOKEN_FILE}')
-
-
 def refresh_token(account):
     headers = {
         **HEADERS,
@@ -184,7 +236,11 @@ def refresh_token(account):
     refresh = result.get('refreshToken')
     if not token or not refresh:
         raise Exception('刷新Token返回数据异常')
-    account['refreshToken'] = refresh
+    
+    if refresh != account['refreshToken']:
+        account['refreshToken'] = refresh
+        account['_token_updated'] = True
+    
     if result.get('uid'):
         account['uid'] = str(result['uid'])
     return token
@@ -230,7 +286,9 @@ def app_sign(token, uid, device_id):
 def get_sign_state(token, game_id):
     resp = get(GAME_SIGNIN_STATE_URL, {'gameId': game_id}, {'Authorization': token})
     data = json_resp(resp, '签到状态')
-    return (data.get('data') or {}) if is_ok(data) else {}
+    if is_ok(data):
+        return data.get('data') or {}
+    return {}
 
 
 def get_rewards(token, role_id, game_id):
@@ -288,6 +346,68 @@ def game_sign(token, role_id, game_id):
     return False, '游戏签到失败'
 
 
+def parse_account(text):
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        raw = json.loads(text)
+    except:
+        return {
+            'refreshToken': text,
+            'uid': '',
+            'deviceId': uuid.uuid4().hex,
+            'gameId': DEFAULT_GAME_ID,
+            'roleIds': [],
+        }
+    return {
+        'refreshToken': raw.get('refreshToken') or raw.get('token') or '',
+        'uid': str(raw.get('uid') or ''),
+        'deviceId': raw.get('deviceId') or raw.get('deviceid') or uuid.uuid4().hex,
+        'gameId': raw.get('gameId') or raw.get('game_id') or DEFAULT_GAME_ID,
+        'roleIds': raw.get('roleIds') or raw.get('role_ids') or raw.get('roleId') or [],
+    }
+
+
+def account_to_json(account):
+    return json.dumps({
+        'refreshToken': account['refreshToken'],
+        'uid': account.get('uid', ''),
+        'deviceId': account.get('deviceId', ''),
+        'gameId': account.get('gameId', DEFAULT_GAME_ID),
+        'roleIds': account.get('roleIds', [])
+    }, ensure_ascii=False, separators=(',', ': '))
+
+
+def load_accounts():
+    token = os.environ.get('TJD_TOKEN', '').strip()
+    if not token:
+        return [], None
+    
+    lines = [l.strip() for l in token.replace('\r\n', '\n').split('\n') if l.strip()]
+    if len(lines) == 1 and ',' in lines[0] and not lines[0].startswith('{'):
+        lines = [l.strip() for l in lines[0].split(',') if l.strip()]
+    
+    accounts = [a for a in [parse_account(l) for l in lines] if a and a['refreshToken']]
+    
+    env_info = ql_api.get_env('TJD_TOKEN')
+    return accounts, env_info
+
+
+def save_accounts(accounts, env_info):
+    if not ql_api.enabled:
+        return
+    
+    token_value = '\n'.join(account_to_json(acc) for acc in accounts)
+    
+    if env_info:
+        ql_api.update_env('TJD_TOKEN', token_value, env_info.get('id'), env_info.get('remarks', ''))
+        print('Token已自动更新到青龙环境变量')
+    else:
+        ql_api.update_env('TJD_TOKEN', token_value, remarks='塔吉多签到Token')
+        print('Token已自动保存到青龙环境变量')
+
+
 def do_sign(account):
     account['gameId'] = account.get('gameId') or DEFAULT_GAME_ID
     account['deviceId'] = account.get('deviceId') or uuid.uuid4().hex
@@ -336,17 +456,21 @@ def main():
     print('塔吉多自动签到')
     print('=' * 50)
     
-    accounts = read_accounts()
+    if ql_api.enabled:
+        print(f'青龙API已启用: {ql_api.url}')
+    print()
+    
+    accounts, env_info = load_accounts()
     if not accounts:
-        print(f'未找到账号，请在 {TOKEN_FILE} 中配置')
-        print('格式: {"refreshToken":"xxx","uid":"xxx","deviceId":"xxx","gameId":"1289","roleIds":["xxx"]}')
-        print('或直接填写 refreshToken 字符串')
+        print('未配置账号，请设置环境变量 TJD_TOKEN')
+        print('获取Token方法: 在本地运行 get_token.py')
         return False
     
     print(f'读取到 {len(accounts)} 个账号\n')
     
     results = []
     success = True
+    need_save = False
     
     for i, account in enumerate(accounts, 1):
         print(f'--- 账号 {i} ---')
@@ -355,13 +479,16 @@ def main():
             results.append(f'账号{i}: {"成功" if ok else "失败"}')
             if not ok:
                 success = False
+            if account.get('_token_updated'):
+                need_save = True
         except Exception as e:
             print(f'签到失败: {e}')
             results.append(f'账号{i}: 失败 - {e}')
             success = False
         print()
     
-    save_accounts(accounts)
+    if need_save and ql_api.enabled:
+        save_accounts(accounts, env_info)
     
     print('=' * 50)
     print('签到结果:')
