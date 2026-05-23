@@ -258,7 +258,7 @@ def main():
             'roleIds': role_ids
         }
         
-        token_json = json.dumps(account, ensure_ascii=False, indent=2)
+        token_json = json.dumps(account, ensure_ascii=False, separators=(',', ': '))
         
         print('=' * 60)
         print('获取成功！请复制以下内容到青龙面板环境变量')

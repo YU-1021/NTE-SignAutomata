@@ -243,6 +243,16 @@ def parse_account(text):
     }
 
 
+def account_to_json(account):
+    return json.dumps({
+        'refreshToken': account['refreshToken'],
+        'uid': account['uid'],
+        'deviceId': account['deviceId'],
+        'gameId': account['gameId'],
+        'roleIds': account['roleIds']
+    }, ensure_ascii=False, separators=(',', ': '))
+
+
 def load_accounts():
     token = os.environ.get('TJD_TOKEN', '').strip()
     if not token:
@@ -251,6 +261,45 @@ def load_accounts():
     if len(lines) == 1 and ',' in lines[0] and not lines[0].startswith('{'):
         lines = [l.strip() for l in lines[0].split(',') if l.strip()]
     return [a for a in [parse_account(l) for l in lines] if a and a['refreshToken']]
+
+
+def save_accounts(accounts):
+    try:
+        ql_dir = os.environ.get('QL_DIR', '/ql')
+        env_file = os.path.join(ql_dir, 'data', 'env.sh')
+        
+        token_value = '\n'.join(account_to_json(acc) for acc in accounts)
+        
+        env_content = ''
+        if os.path.exists(env_file):
+            with open(env_file, 'r', encoding='utf-8') as f:
+                env_content = f.read()
+        
+        lines = env_content.split('\n')
+        new_lines = []
+        found = False
+        
+        for line in lines:
+            if line.startswith('export TJD_TOKEN='):
+                new_lines.append(f'export TJD_TOKEN="{token_value}"')
+                found = True
+            else:
+                new_lines.append(line)
+        
+        if not found:
+            if new_lines and new_lines[-1]:
+                new_lines.append('')
+            new_lines.append(f'export TJD_TOKEN="{token_value}"')
+        
+        os.makedirs(os.path.dirname(env_file), exist_ok=True)
+        with open(env_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(new_lines))
+        
+        print('Token已更新保存')
+        return True
+    except Exception as e:
+        print(f'保存Token失败: {e}')
+        return False
 
 
 def do_sign(account):
@@ -275,6 +324,7 @@ def do_sign(account):
         role_ids.extend([r.strip() for r in env_roles.replace('\n', ',').split(',') if r.strip()])
     if not role_ids and uid:
         role_ids = get_roles(token, uid, account['deviceId'], account['gameId'])
+    account['roleIds'] = role_ids
     
     if not role_ids:
         print('未找到角色ID')
@@ -324,6 +374,8 @@ def main():
             results.append(f'账号{i}: 失败 - {e}')
             success = False
         print()
+    
+    save_accounts(accounts)
     
     print('=' * 50)
     print('签到结果:')
